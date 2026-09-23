@@ -157,6 +157,7 @@ internal class ArtifactsGenerator(
     override fun onCommandMetadataUpdate(cmd: MaestroCommand, metadata: Orchestra.CommandMetadata) {
         debugOutput.commands[cmd]?.let { existing ->
             existing.evaluatedCommand = metadata.evaluatedCommand
+            existing.jevHealing = metadata.jevHealing
         }
     }
 

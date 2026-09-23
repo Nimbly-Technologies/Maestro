@@ -20,6 +20,8 @@
 package maestro.orchestra
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.yield
@@ -32,6 +34,7 @@ import maestro.Filters.asFilter
 import maestro.FindElementResult
 import maestro.Maestro
 import maestro.DeviceConnectionException
+import maestro.device.Platform
 import maestro.MaestroException
 import maestro.Point
 import maestro.ScreenRecording
@@ -149,6 +152,7 @@ class Orchestra(
     private val onCommandMetadataUpdate: (MaestroCommand, CommandMetadata) -> Unit = { _, _ -> },
     private val onStepScreenshotCaptured: (sequenceNumber: Int, relativePath: String) -> Unit = { _, _ -> },
     private val onCommandGeneratedOutput: (command: Command, defects: List<Defect>, screenshot: Buffer) -> Unit = { _, _, _ -> },
+    val jevHealingClient: JevHealingClient? = null,
     private val apiKey: String? = null,
     private val AIPredictionEngine: AIPredictionEngine? = apiKey?.let { CloudAIPredictionEngine(it) },
     private val flowController: FlowController = DefaultFlowController(),
@@ -327,7 +331,7 @@ class Orchestra(
 
                 try {
                     try {
-                        executeCommand(evaluatedCommand, config)
+                        executeCommand(evaluatedCommand, config, command)
                         dispatchFinished(command, CommandOutcome.Completed, sequenceNumber)
                         onCommandComplete(index, command)
                     } catch (e: MaestroException) {
@@ -383,7 +387,7 @@ class Orchestra(
     /**
      * Returns true if the command mutated device state (i.e. interacted with the device), false otherwise.
      */
-    private suspend fun executeCommand(maestroCommand: MaestroCommand, config: MaestroConfig?): Boolean {
+    private suspend fun executeCommand(maestroCommand: MaestroCommand, config: MaestroConfig?, originalCommand: MaestroCommand): Boolean {
         val command = maestroCommand.asCommand()
 
         flowController.waitIfPaused()
@@ -391,6 +395,7 @@ class Orchestra(
         return when (command) {
             is TapOnElementCommand -> {
                 tapOnElement(
+                    rawCommand = originalCommand,
                     command = command,
                     retryIfNoChange = command.retryIfNoChange ?: false,
                     waitUntilVisible = command.waitUntilVisible ?: false,
@@ -1118,7 +1123,7 @@ class Orchestra(
 
                     return@mapIndexed try {
                         try {
-                            executeCommand(evaluatedCommand, config)
+                            executeCommand(evaluatedCommand, config, command)
                                 .also {
                                     dispatchFinished(command, CommandOutcome.Completed, sequenceNumber)
                                     onCommandComplete(index, command)
@@ -1333,19 +1338,31 @@ class Orchestra(
     }
 
     private suspend fun tapOnElement(
+        rawCommand: MaestroCommand,
         command: TapOnElementCommand,
         retryIfNoChange: Boolean,
         waitUntilVisible: Boolean,
         config: MaestroConfig?,
     ): Boolean {
-        val result = findElement(command.selector, optional = command.optional)
+        val healingSettings = runCatching { JevHealingSettings.from(config) }
+            .getOrDefault(JevHealingSettings())
 
+        val result = try {
+            findElement(command.selector, optional = command.optional)
+        } catch (notFound: MaestroException.ElementNotFound) {
+            if (canAttemptJevHealing(command, healingSettings)) {
+                if (attemptJevHealing(rawCommand, command, config, healingSettings)) {
+                    return true
+                }
+            }
+            throw notFound
+        }
 
         // Handle element-relative tap if specified
         val relativePoint = command.relativePoint
         if (relativePoint != null) {
-            val tapPoint = calculateElementRelativePoint(result.element, relativePoint)      
-                  
+            val tapPoint = calculateElementRelativePoint(result.element, relativePoint)
+
             maestro.tap(
                 x = tapPoint.x,
                 y = tapPoint.y,
@@ -1369,6 +1386,171 @@ class Orchestra(
         }
 
         return true
+    }
+
+    /**
+     * Healing is intentionally limited to a plain element tap. A point/relative tap,
+     * long press, repeat, retry, or wait-until-visible option can carry intent that
+     * cannot safely be inferred from a replacement accessibility node.
+     */
+    private fun canAttemptJevHealing(
+        command: TapOnElementCommand,
+        settings: JevHealingSettings,
+    ): Boolean {
+        if (!settings.enabled || command.relativePoint != null || command.longPress == true ||
+            command.repeat != null || command.retryIfNoChange == true || command.waitUntilVisible == true
+        ) {
+            return false
+        }
+        return runCatching { maestro.cachedDeviceInfo.platform == Platform.ANDROID }.getOrDefault(false)
+    }
+
+    private suspend fun attemptJevHealing(
+        rawCommand: MaestroCommand,
+        command: TapOnElementCommand,
+        config: MaestroConfig?,
+        settings: JevHealingSettings,
+    ): Boolean {
+        val started = System.nanoTime()
+        val selector = JevHealingCandidates.selectorDescription(command.selector.description())
+        val hierarchy = try {
+            maestro.viewHierarchy(excludeKeyboardElements = true)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "unavailable",
+                    originalSelector = selector,
+                    candidateCount = 0,
+                    latencyMs = elapsedMs(started),
+                    reason = "hierarchy_unavailable",
+                ),
+            )
+            return false
+        }
+
+        val candidates = try {
+            JevHealingCandidates.collect(
+                hierarchy.root,
+                maestro.cachedDeviceInfo,
+                settings.maxCandidates,
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "unavailable",
+                    originalSelector = selector,
+                    candidateCount = 0,
+                    latencyMs = elapsedMs(started),
+                    reason = "hierarchy_unavailable",
+                ),
+            )
+            return false
+        }
+        val candidateIds = candidates.map { it.payload.id }
+        if (candidates.isEmpty()) {
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "refused",
+                    originalSelector = selector,
+                    candidateCount = 0,
+                    latencyMs = elapsedMs(started),
+                    reason = "no_candidates",
+                ),
+            )
+            return false
+        }
+
+        val request = JevHealingRequest(selector, candidates.map { it.payload })
+        val decision = try {
+            val client = jevHealingClient ?: HttpJevHealingClient(settings)
+            runInterruptible(Dispatchers.IO) { client.select(request) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            logger.warn("Jev mobile healing provider failed; preserving the original tap lookup error")
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "unavailable",
+                    originalSelector = selector,
+                    candidateCount = candidates.size,
+                    candidateIds = candidateIds,
+                    latencyMs = elapsedMs(started),
+                    reason = "provider_failure",
+                ),
+            )
+            return false
+        }
+
+        val target = candidates.firstOrNull { it.payload.id == decision.candidateId }
+        val safeConfidence = decision.confidence.isFinite() &&
+            decision.operationConfidence.isFinite() &&
+            decision.probability.isFinite() &&
+            decision.margin.isFinite() &&
+            decision.confidence >= settings.minConfidence &&
+            decision.operationConfidence >= settings.minConfidence &&
+            decision.probability >= settings.minConfidence &&
+            decision.margin >= settings.minMargin
+        if (target == null || !safeConfidence) {
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "refused",
+                    originalSelector = selector,
+                    candidateCount = candidates.size,
+                    candidateIds = candidateIds,
+                    candidateId = decision.candidateId.takeIf { target != null },
+                    confidence = decision.confidence,
+                    operationConfidence = decision.operationConfidence,
+                    probability = decision.probability,
+                    margin = decision.margin,
+                    latencyMs = elapsedMs(started),
+                    reason = if (target == null) "unknown_candidate" else "low_confidence",
+                ),
+            )
+            return false
+        }
+
+        // Exactly one normal Maestro element tap. No retry/repeat is added by healing.
+        maestro.tap(
+            element = target.element,
+            initialHierarchy = hierarchy,
+            retryIfNoChange = false,
+            waitUntilVisible = false,
+            longPress = false,
+            appId = config?.appId,
+            tapRepeat = null,
+            waitToSettleTimeoutMs = command.waitToSettleTimeoutMs,
+        )
+        recordJevHealing(
+            rawCommand,
+            JevHealingMetadata(
+                status = "healed",
+                originalSelector = selector,
+                candidateCount = candidates.size,
+                candidateIds = candidateIds,
+                candidateId = decision.candidateId,
+                confidence = decision.confidence,
+                operationConfidence = decision.operationConfidence,
+                probability = decision.probability,
+                margin = decision.margin,
+                latencyMs = elapsedMs(started),
+            ),
+        )
+        return true
+    }
+
+    private fun elapsedMs(started: Long): Long = (System.nanoTime() - started) / 1_000_000L
+
+    private fun recordJevHealing(rawCommand: MaestroCommand, metadata: JevHealingMetadata) {
+        updateMetadata(rawCommand, getMetadata(rawCommand).copy(jevHealing = metadata))
     }
 
     private suspend fun tapOnPoint(
@@ -1838,7 +2020,8 @@ class Orchestra(
         val logMessages: List<String> = emptyList(),
         val insight: Insight = Insight("", Insight.Level.NONE),
         val aiReasoning: String? = null,
-        val labeledCommand: String? = null
+        val labeledCommand: String? = null,
+        val jevHealing: JevHealingMetadata? = null,
     )
 
     enum class ErrorResolution {

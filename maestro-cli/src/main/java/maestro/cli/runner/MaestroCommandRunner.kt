@@ -174,6 +174,7 @@ object MaestroCommandRunner {
                 commandMetadata[command] = metadata
                 // Update debug output with evaluated command for interpolated labels
                 debugOutput.commands[command]?.evaluatedCommand = metadata.evaluatedCommand
+                debugOutput.commands[command]?.jevHealing = metadata.jevHealing
                 refreshUi()
             },
             onCommandGeneratedOutput = { command, defects, screenshot ->

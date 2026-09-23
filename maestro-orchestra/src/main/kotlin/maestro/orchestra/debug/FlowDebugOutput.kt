@@ -19,6 +19,7 @@ data class CommandDebugMetadata(
     var depth: Int = 0,
     var evaluatedCommand: MaestroCommand? = null,
     val artifacts: MutableList<CommandArtifact> = mutableListOf(),
+    var jevHealing: maestro.orchestra.JevHealingMetadata? = null,
     /** Back-reference used to attribute collector records; excluded from commands.json (it keys this map). */
     @field:JsonIgnore var command: MaestroCommand? = null,
 ) {
