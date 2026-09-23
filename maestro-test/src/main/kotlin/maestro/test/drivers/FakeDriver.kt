@@ -41,11 +41,14 @@ import java.awt.image.BufferedImage
 import java.io.File
 import javax.imageio.ImageIO
 
-open class FakeDriver : Driver {
+open class FakeDriver(private val fakePlatform: Platform = Platform.IOS) : Driver {
 
     private var state: State = State.NOT_INITIALIZED
     private var layout: FakeLayoutElement = FakeLayoutElement()
     private var installedApps = mutableSetOf<String>()
+
+    /** Test seam for simulating a hierarchy that changes while a provider is running. */
+    var contentDescriptorOverride: (() -> TreeNode)? = null
 
     private val events = mutableListOf<Event>()
 
@@ -94,7 +97,7 @@ open class FakeDriver : Driver {
         ensureOpen()
 
         return DeviceInfo(
-            platform = Platform.IOS,
+            platform = fakePlatform,
             widthPixels = 1080,
             heightPixels = 1920,
             widthGrid = 540,
@@ -182,7 +185,7 @@ open class FakeDriver : Driver {
     override fun contentDescriptor(excludeKeyboardElements: Boolean): TreeNode {
         ensureOpen()
 
-        return layout.toTreeNode()
+        return contentDescriptorOverride?.invoke() ?: layout.toTreeNode()
     }
 
     override fun scrollVertical() {
