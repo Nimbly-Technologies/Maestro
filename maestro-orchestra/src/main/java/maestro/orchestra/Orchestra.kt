@@ -1347,10 +1347,15 @@ class Orchestra(
         val healingSettings = runCatching { JevHealingSettings.from(config) }
             .getOrDefault(JevHealingSettings())
 
+        val healingEligible = canAttemptJevHealing(command, healingSettings)
         val result = try {
-            findElement(command.selector, optional = command.optional)
+            findElement(
+                command.selector,
+                optional = command.optional,
+                timeoutMs = healingSettings.lookupTimeoutMs.takeIf { healingEligible },
+            )
         } catch (notFound: MaestroException.ElementNotFound) {
-            if (canAttemptJevHealing(command, healingSettings)) {
+            if (healingEligible) {
                 if (attemptJevHealing(rawCommand, command, config, healingSettings)) {
                     return true
                 }
@@ -1405,6 +1410,11 @@ class Orchestra(
         return runCatching { maestro.cachedDeviceInfo.platform == Platform.ANDROID }.getOrDefault(false)
     }
 
+    private data class RefreshedHealingHierarchy(
+        val hierarchy: ViewHierarchy,
+        val original: FindElementResult?,
+    )
+
     private suspend fun attemptJevHealing(
         rawCommand: MaestroCommand,
         command: TapOnElementCommand,
@@ -1454,6 +1464,20 @@ class Orchestra(
         }
         val candidateIds = candidates.map { it.payload.id }
         if (candidates.isEmpty()) {
+            val refreshed = refreshHealingHierarchy(command.selector)
+            if (refreshed != null && tapOriginalIfPresent(
+                    rawCommand,
+                    command,
+                    config,
+                    selector,
+                    candidateIds,
+                    candidates.size,
+                    started,
+                    refreshed,
+                )
+            ) {
+                return true
+            }
             recordJevHealing(
                 rawCommand,
                 JevHealingMetadata(
@@ -1474,6 +1498,20 @@ class Orchestra(
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (_: Exception) {
+            val refreshed = refreshHealingHierarchy(command.selector)
+            if (refreshed != null && tapOriginalIfPresent(
+                    rawCommand,
+                    command,
+                    config,
+                    selector,
+                    candidateIds,
+                    candidates.size,
+                    started,
+                    refreshed,
+                )
+            ) {
+                return true
+            }
             logger.warn("Jev mobile healing provider failed; preserving the original tap lookup error")
             recordJevHealing(
                 rawCommand,
@@ -1498,6 +1536,44 @@ class Orchestra(
             decision.operationConfidence >= settings.minConfidence &&
             decision.probability >= settings.minConfidence &&
             decision.margin >= settings.minMargin
+
+        // The provider may have taken long enough for the originally requested element to appear.
+        // Prefer that fresh exact match over a model-selected replacement.
+        val refreshed = refreshHealingHierarchy(command.selector)
+        if (refreshed == null) {
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "unavailable",
+                    originalSelector = selector,
+                    candidateCount = candidates.size,
+                    candidateIds = candidateIds,
+                    candidateId = decision.candidateId.takeIf { target != null },
+                    confidence = decision.confidence,
+                    operationConfidence = decision.operationConfidence,
+                    probability = decision.probability,
+                    margin = decision.margin,
+                    latencyMs = elapsedMs(started),
+                    reason = "hierarchy_unavailable",
+                ),
+            )
+            return false
+        }
+        if (tapOriginalIfPresent(
+                rawCommand,
+                command,
+                config,
+                selector,
+                candidateIds,
+                candidates.size,
+                started,
+                refreshed,
+                decision,
+            )
+        ) {
+            return true
+        }
+
         if (target == null || !safeConfidence) {
             recordJevHealing(
                 rawCommand,
@@ -1518,10 +1594,60 @@ class Orchestra(
             return false
         }
 
+        val currentCandidates = try {
+            JevHealingCandidates.collect(
+                refreshed.hierarchy.root,
+                maestro.cachedDeviceInfo,
+                settings.maxCandidates,
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "unavailable",
+                    originalSelector = selector,
+                    candidateCount = candidates.size,
+                    candidateIds = candidateIds,
+                    candidateId = decision.candidateId,
+                    confidence = decision.confidence,
+                    operationConfidence = decision.operationConfidence,
+                    probability = decision.probability,
+                    margin = decision.margin,
+                    latencyMs = elapsedMs(started),
+                    reason = "hierarchy_unavailable",
+                ),
+            )
+            return false
+        }
+        val currentTarget = currentCandidates
+            .filter { candidatesMatch(target.payload, it.payload) }
+            .singleOrNull()
+        if (currentTarget == null) {
+            recordJevHealing(
+                rawCommand,
+                JevHealingMetadata(
+                    status = "refused",
+                    originalSelector = selector,
+                    candidateCount = candidates.size,
+                    candidateIds = candidateIds,
+                    candidateId = decision.candidateId,
+                    confidence = decision.confidence,
+                    operationConfidence = decision.operationConfidence,
+                    probability = decision.probability,
+                    margin = decision.margin,
+                    latencyMs = elapsedMs(started),
+                    reason = "stale_candidate",
+                ),
+            )
+            return false
+        }
+
         // Exactly one normal Maestro element tap. No retry/repeat is added by healing.
         maestro.tap(
-            element = target.element,
-            initialHierarchy = hierarchy,
+            element = currentTarget.element,
+            initialHierarchy = refreshed.hierarchy,
             retryIfNoChange = false,
             waitUntilVisible = false,
             longPress = false,
@@ -1542,6 +1668,88 @@ class Orchestra(
                 probability = decision.probability,
                 margin = decision.margin,
                 latencyMs = elapsedMs(started),
+            ),
+        )
+        return true
+    }
+
+    private suspend fun refreshHealingHierarchy(selector: ElementSelector): RefreshedHealingHierarchy? {
+        return try {
+            val hierarchy = maestro.viewHierarchy(excludeKeyboardElements = true)
+            RefreshedHealingHierarchy(
+                hierarchy = hierarchy,
+                original = findElementInHierarchy(selector, hierarchy),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun findElementInHierarchy(
+        selector: ElementSelector,
+        hierarchy: ViewHierarchy,
+    ): FindElementResult? {
+        val searchHierarchy = resolveParentHierarchy(selector.childOf, hierarchy) ?: return null
+        val (_, filterFunc) = buildFilter(selector)
+        val element = filterFunc(searchHierarchy.aggregate()).firstOrNull()?.toUiElementOrNull() ?: return null
+        return FindElementResult(element, hierarchy)
+    }
+
+    private fun candidatesMatch(
+        expected: JevCandidatePayload,
+        current: JevCandidatePayload,
+    ): Boolean {
+        if (expected.label != current.label ||
+            expected.role != current.role ||
+            expected.resourceId != current.resourceId ||
+            expected.enabled != current.enabled ||
+            expected.visible != current.visible
+        ) {
+            return false
+        }
+
+        // A candidate that moved or changed screens must be refused even when its resource ID
+        // and label are unchanged. Reuse only the exact bounded geometry observed by the provider.
+        return expected.bounds == current.bounds
+    }
+
+    private suspend fun tapOriginalIfPresent(
+        rawCommand: MaestroCommand,
+        command: TapOnElementCommand,
+        config: MaestroConfig?,
+        selector: String,
+        candidateIds: List<String>,
+        candidateCount: Int,
+        started: Long,
+        refreshed: RefreshedHealingHierarchy,
+        decision: JevHealingDecision? = null,
+    ): Boolean {
+        val original = refreshed.original ?: return false
+        maestro.tap(
+            element = original.element,
+            initialHierarchy = original.hierarchy,
+            retryIfNoChange = false,
+            waitUntilVisible = false,
+            longPress = false,
+            appId = config?.appId,
+            tapRepeat = null,
+            waitToSettleTimeoutMs = command.waitToSettleTimeoutMs,
+        )
+        recordJevHealing(
+            rawCommand,
+            JevHealingMetadata(
+                status = "skipped",
+                originalSelector = selector,
+                candidateCount = candidateCount,
+                candidateIds = candidateIds,
+                confidence = decision?.confidence,
+                operationConfidence = decision?.operationConfidence,
+                probability = decision?.probability,
+                margin = decision?.margin,
+                latencyMs = elapsedMs(started),
+                reason = "original_appeared",
             ),
         )
         return true

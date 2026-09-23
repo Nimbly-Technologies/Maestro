@@ -47,6 +47,9 @@ open class FakeDriver(private val fakePlatform: Platform = Platform.IOS) : Drive
     private var layout: FakeLayoutElement = FakeLayoutElement()
     private var installedApps = mutableSetOf<String>()
 
+    /** Test seam for simulating a hierarchy that changes while a provider is running. */
+    var contentDescriptorOverride: (() -> TreeNode)? = null
+
     private val events = mutableListOf<Event>()
 
     private var copiedText: String? = null
@@ -182,7 +185,7 @@ open class FakeDriver(private val fakePlatform: Platform = Platform.IOS) : Drive
     override fun contentDescriptor(excludeKeyboardElements: Boolean): TreeNode {
         ensureOpen()
 
-        return layout.toTreeNode()
+        return contentDescriptorOverride?.invoke() ?: layout.toTreeNode()
     }
 
     override fun scrollVertical() {

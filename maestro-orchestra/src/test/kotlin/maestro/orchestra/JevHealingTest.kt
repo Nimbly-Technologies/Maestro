@@ -155,12 +155,14 @@ class JevHealingTest {
     @Test
     fun `healing is disabled unless explicitly configured and endpoint stays local`() {
         assertThat(JevHealingSettings.from(MaestroConfig()).enabled).isFalse()
+        assertThat(JevHealingSettings.from(MaestroConfig()).lookupTimeoutMs).isNull()
 
         val config = MaestroConfig(
             ext = mapOf(
                 "jevHealing" to mapOf(
                     "enabled" to true,
                     "timeoutMs" to 10_000,
+                    "lookupTimeoutMs" to 2_000,
                     "maxCandidates" to 100,
                     "endpoint" to "http://127.0.0.1:8767/v1/mobile/heal",
                 ),
@@ -169,7 +171,28 @@ class JevHealingTest {
         val settings = JevHealingSettings.from(config)
         assertThat(settings.enabled).isTrue()
         assertThat(settings.timeoutMs).isEqualTo(4_000L)
+        assertThat(settings.lookupTimeoutMs).isEqualTo(2_000L)
         assertThat(settings.maxCandidates).isEqualTo(32)
+
+        val boundedConfig = MaestroConfig(
+            ext = mapOf(
+                "jevHealing" to mapOf(
+                    "enabled" to true,
+                    "lookupTimeoutMs" to 50,
+                ),
+            ),
+        )
+        assertThat(JevHealingSettings.from(boundedConfig).lookupTimeoutMs).isEqualTo(100L)
+
+        val upperBoundedConfig = MaestroConfig(
+            ext = mapOf(
+                "jevHealing" to mapOf(
+                    "enabled" to true,
+                    "lookupTimeoutMs" to 30_000,
+                ),
+            ),
+        )
+        assertThat(JevHealingSettings.from(upperBoundedConfig).lookupTimeoutMs).isEqualTo(17_000L)
 
         assertThrows<IllegalArgumentException> {
             JevHealingSettings.from(

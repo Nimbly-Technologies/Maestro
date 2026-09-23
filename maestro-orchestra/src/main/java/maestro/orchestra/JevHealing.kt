@@ -54,6 +54,11 @@ data class JevHealingSettings(
     val enabled: Boolean = false,
     val endpoint: URI = DEFAULT_ENDPOINT,
     val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+    /**
+     * Optional timeout for the normal element lookup before Jev is consulted.
+     * A null value preserves Maestro's existing lookup timeout.
+     */
+    val lookupTimeoutMs: Long? = null,
     val maxCandidates: Int = DEFAULT_MAX_CANDIDATES,
     val minConfidence: Double = DEFAULT_MIN_CONFIDENCE,
     val minMargin: Double = DEFAULT_MIN_MARGIN,
@@ -61,6 +66,8 @@ data class JevHealingSettings(
     companion object {
         const val CONFIG_KEY = "jevHealing"
         const val DEFAULT_TIMEOUT_MS = 4_000L
+        const val MIN_LOOKUP_TIMEOUT_MS = 100L
+        const val MAX_LOOKUP_TIMEOUT_MS = 17_000L
         const val DEFAULT_MAX_CANDIDATES = 32
         const val DEFAULT_MIN_CONFIDENCE = 0.70
         const val DEFAULT_MIN_MARGIN = 0.15
@@ -76,6 +83,9 @@ data class JevHealingSettings(
                 "Jev mobile healing endpoint must be a loopback HTTP URL"
             }
             val timeoutMs = raw["timeoutMs"].asLong(DEFAULT_TIMEOUT_MS).coerceIn(100L, DEFAULT_TIMEOUT_MS)
+            val lookupTimeoutMs = raw["lookupTimeoutMs"]
+                .asLongOrNull()
+                ?.coerceIn(MIN_LOOKUP_TIMEOUT_MS, MAX_LOOKUP_TIMEOUT_MS)
             val maxCandidates = raw["maxCandidates"].asInt(DEFAULT_MAX_CANDIDATES).coerceIn(1, DEFAULT_MAX_CANDIDATES)
             val minConfidence = raw["minConfidence"].asDouble(DEFAULT_MIN_CONFIDENCE).coerceIn(0.0, 1.0)
             val minMargin = raw["minMargin"].asDouble(DEFAULT_MIN_MARGIN).coerceIn(0.0, 1.0)
@@ -83,6 +93,7 @@ data class JevHealingSettings(
                 enabled = true,
                 endpoint = endpoint,
                 timeoutMs = timeoutMs,
+                lookupTimeoutMs = lookupTimeoutMs,
                 maxCandidates = maxCandidates,
                 minConfidence = minConfidence,
                 minMargin = minMargin,
@@ -93,6 +104,12 @@ data class JevHealingSettings(
             is Number -> toLong()
             is String -> toLongOrNull() ?: default
             else -> default
+        }
+
+        private fun Any?.asLongOrNull(): Long? = when (this) {
+            is Number -> toLong()
+            is String -> toLongOrNull()
+            else -> null
         }
 
         private fun Any?.asInt(default: Int): Int = when (this) {
