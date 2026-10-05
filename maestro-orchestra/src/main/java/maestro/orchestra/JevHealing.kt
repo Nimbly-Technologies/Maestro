@@ -281,7 +281,9 @@ object JevHealingCandidates {
                 hierarchy.getElementAt(root, center.x, center.y)
             }
             val visibleAtCenter = inheritedFromChild || (hitAtCenter != null &&
-                (node === hitAtCenter || (node.clickable == true && node.aggregate().any { it === hitAtCenter })))
+                (node === hitAtCenter || (node.clickable == true && node.aggregate().any { it === hitAtCenter }))) ||
+                (hitAtCenter != null && hitAtCenter.clickable != true &&
+                    element?.bounds?.center()?.let { receivesTapThroughOverlay(root, node, it) } == true)
             val include = element != null &&
                 visibleGeometry &&
                 node.enabled != false &&
@@ -350,6 +352,29 @@ object JevHealingCandidates {
                 (SENSITIVE.containsMatchIn(key) || SENSITIVE.containsMatchIn(value)) &&
                     key.lowercase() !in setOf("text", "contentdescription", "accessibilitytext", "hinttext")
             }
+    }
+
+    /**
+     * Android delivers a tap to the topmost view that consumes it, and a non-clickable view
+     * does not. A full-screen, non-clickable layer drawn last (React Native's
+     * "Notifications (F8)" toast region is on every screen) therefore covers nothing, yet it
+     * is what [ViewHierarchy.getElementAt] reports at every point. Here only clickable views
+     * count as covering [node]: it is reachable when no clickable view sits on top of the
+     * point, or when that view is [node] itself, inside it, or one of its ancestors.
+     */
+    private fun receivesTapThroughOverlay(root: TreeNode, node: TreeNode, point: maestro.Point): Boolean {
+        val receiver = topmostClickableAt(root, point.x, point.y) ?: return true
+        return receiver === node ||
+            node.aggregate().any { it === receiver } ||
+            receiver.aggregate().any { it === node }
+    }
+
+    private fun topmostClickableAt(node: TreeNode, x: Int, y: Int): TreeNode? {
+        node.children.asReversed().forEach { child ->
+            topmostClickableAt(child, x, y)?.let { return it }
+            if (child.clickable == true && child.toUiElementOrNull()?.bounds?.contains(x, y) == true) return child
+        }
+        return null
     }
 
     private fun isActionableRole(role: String): Boolean {

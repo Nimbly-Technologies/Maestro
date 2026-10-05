@@ -55,6 +55,58 @@ class JevHealingTest {
     }
 
     @Test
+    fun `a non-clickable full-screen layer drawn last does not hide the controls under it`() {
+        val overdue = TreeNode(
+            attributes = mutableMapOf(
+                "bounds" to "[20,20][60,40]",
+                "content-desc" to "Overdue",
+                "class" to "android.widget.Button",
+            ),
+            clickable = true,
+            enabled = true,
+        )
+        val toastRegion = TreeNode(
+            attributes = mutableMapOf(
+                "bounds" to "[0,0][100,100]",
+                "content-desc" to "Notifications (F8)",
+                "class" to "android.view.ViewGroup",
+            ),
+            clickable = false,
+            enabled = true,
+        )
+
+        val candidates = JevHealingCandidates.collect(TreeNode(children = listOf(overdue, toastRegion)), deviceInfo, 32)
+
+        assertThat(candidates.map { it.payload.label }).contains("Overdue")
+    }
+
+    @Test
+    fun `a clickable layer on top still hides the controls under it`() {
+        val overdue = TreeNode(
+            attributes = mutableMapOf(
+                "bounds" to "[20,20][60,40]",
+                "content-desc" to "Overdue",
+                "class" to "android.widget.Button",
+            ),
+            clickable = true,
+            enabled = true,
+        )
+        val backdrop = TreeNode(
+            attributes = mutableMapOf(
+                "bounds" to "[0,0][100,100]",
+                "content-desc" to "Close dialog",
+                "class" to "android.view.ViewGroup",
+            ),
+            clickable = true,
+            enabled = true,
+        )
+
+        val candidates = JevHealingCandidates.collect(TreeNode(children = listOf(overdue, backdrop)), deviceInfo, 32)
+
+        assertThat(candidates.map { it.payload.label }).doesNotContain("Overdue")
+    }
+
+    @Test
     fun `generic views cannot consume the candidate bound before a meaningful control`() {
         val largeDevice = deviceInfo.copy(
             widthPixels = 1000,
